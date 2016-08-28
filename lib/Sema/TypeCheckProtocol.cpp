@@ -3924,13 +3924,25 @@ static void diagnoseConformanceFailure(TypeChecker &TC, Type T,
     return;
   }
 
-  // As a special case, diagnose conversion to ExpressibleByNilLiteral, since we
+  // Special case: diagnose conversion to ExpressibleByNilLiteral, since we
   // know this is something involving 'nil'.
   if (Proto->isSpecificProtocol(KnownProtocolKind::ExpressibleByNilLiteral)) {
     TC.diagnose(ComplainLoc, diag::cannot_use_nil_with_this_type, T);
     return;
   }
 
+  // Special case: for enums with a raw type, explain that the failing
+  // conformance to RawRepresentable was inferred.
+  if (auto enumDecl = T->getEnumOrBoundGenericEnum()) {
+	if (Proto->isSpecificProtocol(KnownProtocolKind::RawRepresentable) &&
+		enumDecl->derivesProtocolConformance(Proto) && enumDecl->hasRawType()) {
+
+      TC.diagnose(enumDecl->getInherited()[0].getSourceRange().Start,
+                  diag::enum_raw_type_nonconforming_and_nonsynthable,
+                  T, enumDecl->getRawType());
+      return;
+    }
+  }
 
   TC.diagnose(ComplainLoc, diag::type_does_not_conform,
               T, Proto->getDeclaredType());
@@ -4718,6 +4730,19 @@ void TypeChecker::checkConformancesInContext(DeclContext *dc,
              dc->getDeclaredTypeInContext(),
              diag.Protocol->getName());
 
+    // Special case: explain that 'RawRepresentable' conformance
+    // is implied for enums which already declare a raw type.
+    if (auto enumDecl = dyn_cast<EnumDecl>(existingDecl)) {
+      if (diag.Protocol->isSpecificProtocol(KnownProtocolKind::RawRepresentable) &&
+          enumDecl->derivesProtocolConformance(diag.Protocol) &&
+          enumDecl->hasRawType()) {
+        diagnose(enumDecl->getInherited()[0].getSourceRange().Start,
+                 diag::enum_declares_rawrep_with_raw_type,
+                 dc->getDeclaredTypeInContext(), enumDecl->getRawType());
+        continue;
+      }
+    }
+
     diagnose(existingDecl, diag::declared_protocol_conformance_here,
              dc->getDeclaredTypeInContext(),
              static_cast<unsigned>(diag.ExistingKind),
@@ -4915,9 +4940,6 @@ ValueDecl *TypeChecker::deriveProtocolRequirement(DeclContext *DC,
   case KnownProtocolKind::Hashable:
     return DerivedConformance::deriveHashable(*this, Decl, TypeDecl, Requirement);
     
-  case KnownProtocolKind::Error:
-    return DerivedConformance::deriveError(*this, Decl, TypeDecl, Requirement);
-
   case KnownProtocolKind::BridgedNSError:
     return DerivedConformance::deriveBridgedNSError(*this, Decl, TypeDecl,
                                                     Requirement);

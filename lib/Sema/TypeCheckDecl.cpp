@@ -2058,6 +2058,8 @@ static Optional<ObjCReason> shouldMarkAsObjC(TypeChecker &TC,
     return ObjCReason::WitnessToObjC;
   else if (VD->isInvalid())
     return None;
+  else if (VD->isOperator())
+    return None;
   // Implicitly generated declarations are not @objc, except for constructors.
   else if (!allowImplicit && VD->isImplicit())
     return None;
@@ -2569,6 +2571,7 @@ static void checkEnumRawValues(TypeChecker &TC, EnumDecl *ED) {
                   diag::enum_with_raw_type_case_with_argument);
       TC.diagnose(ED->getInherited().front().getSourceRange().Start,
                   diag::enum_raw_type_here, rawTy);
+      elt->setInvalid();
       continue;
     }
     
@@ -2587,6 +2590,7 @@ static void checkEnumRawValues(TypeChecker &TC, EnumDecl *ED) {
       // is the first element.
       auto nextValue = getAutomaticRawValueExpr(TC, valueKind, elt, prevValue);
       if (!nextValue) {
+        elt->setInvalid();
         break;
       }
       elt->setRawValueExpr(nextValue);
@@ -4335,6 +4339,8 @@ public:
                         dc->getDeclaredInterfaceType())
               .fixItInsert(FD->getAttributeInsertionLoc(/*forModifier=*/true),
                            "static ");
+
+            FD->setStatic();
           } else {
             TC.diagnose(FD->getLoc(), diag::nonfinal_operator_in_class,
                         operatorName, dc->getDeclaredInterfaceType())
@@ -4350,6 +4356,7 @@ public:
                     dc->getDeclaredInterfaceType())
           .fixItInsert(FD->getAttributeInsertionLoc(/*forModifier=*/true),
                        "static ");
+        FD->setStatic();
       }
     } else if (!dc->isModuleScopeContext()) {
       TC.diagnose(FD, diag::operator_in_local_scope);
@@ -5531,62 +5538,87 @@ public:
         }
       }
 
-      auto overriddenAccess = matchDecl->getFormalAccess();
-
       // Check that the override has the required accessibility.
       // Overrides have to be at least as accessible as what they
       // override, except:
       //   - they don't have to be more accessible than their class and
       //   - a final method may be public instead of open.
-      // FIXME: Copied from TypeCheckProtocol.cpp.
-      Accessibility requiredAccess =
-        std::min(classDecl->getFormalAccess(), overriddenAccess);
-      if (requiredAccess == Accessibility::Open && decl->isFinal())
-        requiredAccess = Accessibility::Public;
-      else if (requiredAccess == Accessibility::Private)
-        requiredAccess = Accessibility::FilePrivate;
-
-      bool shouldDiagnose = false;
-      bool shouldDiagnoseSetter = false;
-      if (!isa<ConstructorDecl>(decl)) {
-        shouldDiagnose = (decl->getFormalAccess() < requiredAccess);
-
-        if (!shouldDiagnose && matchDecl->isSettable(classDecl)) {
-          auto matchASD = cast<AbstractStorageDecl>(matchDecl);
-          if (matchASD->isSetterAccessibleFrom(classDecl)) {
-            auto ASD = cast<AbstractStorageDecl>(decl);
-            const DeclContext *accessDC = nullptr;
-            if (requiredAccess == Accessibility::Internal)
-              accessDC = classDecl->getParentModule();
-            else if (requiredAccess == Accessibility::FilePrivate)
-              accessDC = classDecl->getDeclContext();
-            shouldDiagnoseSetter = ASD->isSettable(accessDC) &&
-                                   !ASD->isSetterAccessibleFrom(accessDC);
-          }
-        }
-      }
-      if (shouldDiagnose || shouldDiagnoseSetter) {
-        bool overriddenForcesAccess = (requiredAccess == overriddenAccess);
-        {
-          auto diag = TC.diagnose(decl, diag::override_not_accessible,
-                                  shouldDiagnoseSetter,
-                                  decl->getDescriptiveKind(),
-                                  overriddenForcesAccess);
-          fixItAccessibility(diag, decl, requiredAccess, shouldDiagnoseSetter);
-        }
-        TC.diagnose(matchDecl, diag::overridden_here);
-      }
-
-      // Diagnose attempts to override a non-open method from outside its
+      // Also diagnose attempts to override a non-open method from outside its
       // defining module.  This is not required for constructors, which are
       // never really "overridden" in the intended sense here, because of
       // course derived classes will change how the class is initialized.
-      if (matchDecl->getFormalAccess(decl->getDeclContext())
-            < Accessibility::Open &&
+      Accessibility matchAccess =
+          matchDecl->getFormalAccess(decl->getDeclContext());
+      if (matchAccess < Accessibility::Open &&
           matchDecl->getModuleContext() != decl->getModuleContext() &&
           !isa<ConstructorDecl>(decl)) {
         TC.diagnose(decl, diag::override_of_non_open,
                     decl->getDescriptiveKind());
+
+      } else if (matchAccess == Accessibility::Open &&
+                 classDecl->getFormalAccess(decl->getDeclContext()) ==
+                   Accessibility::Open &&
+                 decl->getFormalAccess() != Accessibility::Open &&
+                 !decl->isFinal()) {
+        {
+          auto diag = TC.diagnose(decl, diag::override_not_accessible,
+                                  /*setter*/false,
+                                  decl->getDescriptiveKind(),
+                                  /*fromOverridden*/true);
+          fixItAccessibility(diag, decl, Accessibility::Open);
+        }
+        TC.diagnose(matchDecl, diag::overridden_here);
+
+      } else {
+        auto matchAccessScope =
+            matchDecl->getFormalAccessScope(decl->getDeclContext());
+        const DeclContext *requiredAccessScope =
+            classDecl->getFormalAccessScope(decl->getDeclContext());
+
+        // FIXME: This is the same operation as
+        // TypeAccessScopeChecker::intersectAccess.
+        if (!requiredAccessScope) {
+          requiredAccessScope = matchAccessScope;
+        } else if (matchAccessScope) {
+          if (matchAccessScope->isChildContextOf(requiredAccessScope)) {
+            requiredAccessScope = matchAccessScope;
+          } else {
+            assert(requiredAccessScope == matchAccessScope ||
+                   requiredAccessScope->isChildContextOf(matchAccessScope));
+          }
+        }
+
+        bool shouldDiagnose = false;
+        bool shouldDiagnoseSetter = false;
+        if (!isa<ConstructorDecl>(decl)) {
+          shouldDiagnose = !decl->isAccessibleFrom(requiredAccessScope);
+
+          if (!shouldDiagnose && matchDecl->isSettable(decl->getDeclContext())){
+            auto matchASD = cast<AbstractStorageDecl>(matchDecl);
+            if (matchASD->isSetterAccessibleFrom(decl->getDeclContext())) {
+              const auto *ASD = cast<AbstractStorageDecl>(decl);
+              shouldDiagnoseSetter =
+                  ASD->isSettable(requiredAccessScope) &&
+                  !ASD->isSetterAccessibleFrom(requiredAccessScope);
+            }
+          }
+        }
+        if (shouldDiagnose || shouldDiagnoseSetter) {
+          bool overriddenForcesAccess =
+              (requiredAccessScope == matchAccessScope &&
+               matchAccess != Accessibility::Open);
+          Accessibility requiredAccess =
+              accessibilityFromScopeForDiagnostics(requiredAccessScope);
+          {
+            auto diag = TC.diagnose(decl, diag::override_not_accessible,
+                                    shouldDiagnoseSetter,
+                                    decl->getDescriptiveKind(),
+                                    overriddenForcesAccess);
+            fixItAccessibility(diag, decl, requiredAccess,
+                               shouldDiagnoseSetter);
+          }
+          TC.diagnose(matchDecl, diag::overridden_here);
+        }
       }
 
       bool mayHaveMismatchedOptionals =
@@ -8104,12 +8136,11 @@ static void validateAttributes(TypeChecker &TC, Decl *D) {
         error = diag::objc_enum_case_req_objc_enum;
       else if (objcAttr->hasName() && EED->getParentCase()->getElements().size() > 1)
         error = diag::objc_enum_case_multi;
-    } else if (isa<FuncDecl>(D)) {
-      auto func = cast<FuncDecl>(D);
+    } else if (auto *func = dyn_cast<FuncDecl>(D)) {
       if (!checkObjCDeclContext(D))
         error = diag::invalid_objc_decl_context;
       else if (func->isOperator())
-        error = diag::invalid_objc_decl;
+        error = diag::objc_operator;
       else if (func->isAccessor() && !func->isGetterOrSetter())
         error = diag::objc_observing_accessor;
     } else if (isa<ConstructorDecl>(D) ||

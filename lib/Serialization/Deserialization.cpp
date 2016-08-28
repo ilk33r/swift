@@ -1023,6 +1023,13 @@ static void filterValues(Type expectedTy, Module *expectedModule,
           ->getCanonicalSignature() != expectedGenericSig)
       return true;
 
+    // If we don't expect a specific generic signature, ignore anything from a
+    // constrained extension.
+    if (!expectedGenericSig &&
+        isa<ExtensionDecl>(value->getDeclContext()) &&
+        cast<ExtensionDecl>(value->getDeclContext())->isConstrainedExtension())
+      return true;
+
     // If we're looking at members of a protocol or protocol extension,
     // filter by whether we expect to find something in a protocol extension or
     // not. This lets us distinguish between a protocol member and a protocol
@@ -3816,19 +3823,9 @@ Type ModuleFile::getType(TypeID TID) {
     auto nominal = cast<NominalTypeDecl>(getDecl(declID));
     auto parentTy = getType(parentID);
 
-    // Check the first ID to decide if we are using indices to the Decl's
-    // Archetypes. 
     SmallVector<Type, 8> genericArgs;
-    if (rawArgumentIDs.size() > 1 && rawArgumentIDs[0] == INT32_MAX) {
-      for (unsigned i = 1; i < rawArgumentIDs.size(); i++) {
-        auto index = rawArgumentIDs[i];
-        genericArgs.push_back(nominal->getGenericParams()
-                                     ->getAllArchetypes()[index]);
-      }
-    } else {
-      for (TypeID type : rawArgumentIDs)
-        genericArgs.push_back(getType(type));
-    }
+    for (TypeID type : rawArgumentIDs)
+      genericArgs.push_back(getType(type));
 
     auto boundTy = BoundGenericType::get(nominal, parentTy, genericArgs);
     typeOrOffset = boundTy;
